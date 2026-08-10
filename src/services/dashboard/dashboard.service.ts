@@ -4,72 +4,86 @@ import { AuthUser } from '../../middlewares/auth.middleware';
 const getAdminStats = async () => {
   const [
     totalUsers,
-    totalHosts,
+    totalVendors,
+    totalCustomers,
     totalVehicles,
     totalBookings,
-    totalRevenue,
+    revenueAgg,
     pendingBookings,
-    recentBookings,
   ] = await Promise.all([
-    prisma.user.count(),
-    prisma.user.count({ where: { role: 'HOST' } }),
-    prisma.vehicle.count(),
-    prisma.booking.count(),
+    prisma.user.count({ where: { isDeleted: false } }),
+    prisma.user.count({ where: { role: 'VENDOR', isDeleted: false } }),
+    prisma.user.count({ where: { role: 'CUSTOMER', isDeleted: false } }),
+    prisma.vehicle.count({ where: { isDeleted: false } }),
+    prisma.booking.count({ where: { isDeleted: false } }),
     prisma.booking.aggregate({
-      _sum: { totalAmount: true },
-      where: { status: 'COMPLETED' },
+      _sum: { totalPrice: true },
+      where: { isDeleted: false, paymentStatus: 'PAID' },
     }),
-    prisma.booking.count({ where: { status: 'PENDING' } }),
-    prisma.booking.findMany({
-      take: 10,
-      include: {
-        user: { select: { name: true, email: true } },
-        vehicle: { select: { title: true, brand: true, model: true } },
-      },
-      orderBy: { createdAt: 'desc' },
-    }),
+    prisma.booking.count({ where: { status: 'PENDING', isDeleted: false } }),
   ]);
 
   return {
     stats: {
       totalUsers,
-      totalHosts,
+      totalVendors,
+      totalCustomers,
       totalVehicles,
       totalBookings,
-      totalRevenue: totalRevenue._sum.totalAmount ?? 0,
+      totalRevenue: revenueAgg._sum.totalPrice ?? 0,
       pendingBookings,
     },
-    recentBookings,
   };
 };
 
-const getHostStats = async (authUser: AuthUser) => {
-  const [totalVehicles, availableVehicles, totalBookings, completedBookings, totalEarnings] =
-    await Promise.all([
-      prisma.vehicle.count({ where: { hostId: authUser.id } }),
-      prisma.vehicle.count({ where: { hostId: authUser.id, isAvailable: true } }),
-      prisma.booking.count({ where: { vehicle: { hostId: authUser.id } } }),
-      prisma.booking.count({
-        where: { vehicle: { hostId: authUser.id }, status: 'COMPLETED' },
-      }),
-      prisma.booking.aggregate({
-        _sum: { totalAmount: true },
-        where: { vehicle: { hostId: authUser.id }, status: 'COMPLETED' },
-      }),
-    ]);
+const getVendorStats = async (authUser: AuthUser) => {
+  const [totalVehicles, totalBookings, earningsAgg, pendingBookings] = await Promise.all([
+    prisma.vehicle.count({ where: { vendorId: authUser.id, isDeleted: false } }),
+    prisma.booking.count({ where: { vehicle: { vendorId: authUser.id }, isDeleted: false } }),
+    prisma.booking.aggregate({
+      _sum: { totalPrice: true },
+      where: { vehicle: { vendorId: authUser.id }, paymentStatus: 'PAID' },
+    }),
+    prisma.booking.count({
+      where: { vehicle: { vendorId: authUser.id }, status: 'PENDING', isDeleted: false },
+    }),
+  ]);
 
   return {
     stats: {
       totalVehicles,
-      availableVehicles,
       totalBookings,
-      completedBookings,
-      totalEarnings: totalEarnings._sum.totalAmount ?? 0,
+      totalEarnings: earningsAgg._sum.totalPrice ?? 0,
+      pendingBookings,
+    },
+  };
+};
+
+const getCustomerStats = async (authUser: AuthUser) => {
+  const [totalBookings, activeBookings, spentAgg, wishlistCount] = await Promise.all([
+    prisma.booking.count({ where: { userId: authUser.id, isDeleted: false } }),
+    prisma.booking.count({
+      where: { userId: authUser.id, isDeleted: false, status: { in: ['CONFIRMED', 'ONGOING'] } },
+    }),
+    prisma.booking.aggregate({
+      _sum: { totalPrice: true },
+      where: { userId: authUser.id, paymentStatus: 'PAID' },
+    }),
+    prisma.wishlist.count({ where: { userId: authUser.id } }),
+  ]);
+
+  return {
+    stats: {
+      totalBookings,
+      activeBookings,
+      totalSpent: spentAgg._sum.totalPrice ?? 0,
+      wishlistCount,
     },
   };
 };
 
 export const DashboardService = {
   getAdminStats,
-  getHostStats,
+  getVendorStats,
+  getCustomerStats,
 };

@@ -1,101 +1,45 @@
-import bcrypt from 'bcrypt';
-import { z } from 'zod';
-import { env } from '../../config/env';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
 import AppError from '../../utils/AppError';
 import { AuthUser } from '../../middlewares/auth.middleware';
-import generateToken from '../../utils/generateToken';
+import { UserValidation } from './user.validation';
 
-const updateProfileSchema = z.object({
-  name: z.string().min(2).optional(),
-  phone: z.string().optional(),
-  address: z.string().optional(),
-  profileImage: z.string().url().optional(),
-});
+const userSelect = {
+  id: true,
+  name: true,
+  email: true,
+  phone: true,
+  profileImage: true,
+  role: true,
+  authProvider: true,
+  isBlocked: true,
+  isDeleted: true,
+  createdAt: true,
+  updatedAt: true,
+} as const;
 
-const changePasswordSchema = z.object({
-  currentPassword: z.string().min(1, 'Current password is required'),
-  newPassword: z.string().min(6, 'New password must be at least 6 characters'),
-});
+const getAllUsers = async (query: unknown) => {
+  const q = UserValidation.getAllUsersQuerySchema.parse(query);
 
-const updateProfile = async (authUser: AuthUser, payload: z.infer<typeof updateProfileSchema>) => {
-  const data = updateProfileSchema.parse(payload);
+  const page = q.page ?? 1;
+  const limit = q.limit ?? 10;
 
-  const user = await prisma.user.update({
-    where: { id: authUser.id },
-    data,
-    select: {
-      id: true,
-      name: true,
-      email: true,
-      role: true,
-      profileImage: true,
-      phone: true,
-      address: true,
-      updatedAt: true,
-    },
-  });
+  const where: Prisma.UserWhereInput = { isDeleted: false };
 
-  return user;
-};
-
-const changePassword = async (
-  authUser: AuthUser,
-  payload: z.infer<typeof changePasswordSchema>
-) => {
-  const data = changePasswordSchema.parse(payload);
-
-  const user = await prisma.user.findUnique({ where: { id: authUser.id } });
-  if (!user) {
-    throw new AppError(404, 'User not found.');
+  if (q.role) where.role = q.role;
+  if (q.search) {
+    where.OR = [
+      { name: { contains: q.search, mode: 'insensitive' } },
+      { email: { contains: q.search, mode: 'insensitive' } },
+    ];
   }
-
-  if (!user.password) {
-    throw new AppError(400, 'You signed up with Google and do not have a password set.');
-  }
-
-  const isPasswordValid = await bcrypt.compare(data.currentPassword, user.password);
-  if (!isPasswordValid) {
-    throw new AppError(401, 'Current password is incorrect.');
-  }
-
-  const hashedPassword = await bcrypt.hash(data.newPassword, env.BCRYPT_SALT_ROUNDS);
-
-  await prisma.user.update({
-    where: { id: authUser.id },
-    data: { password: hashedPassword },
-  });
-
-  return null;
-};
-
-const getAllUsers = async (query: { page?: number; limit?: number; search?: string }) => {
-  const page = query.page ?? 1;
-  const limit = query.limit ?? 10;
-
-  const where = query.search
-    ? {
-        OR: [
-          { name: { contains: query.search, mode: 'insensitive' as const } },
-          { email: { contains: query.search, mode: 'insensitive' as const } },
-        ],
-      }
-    : {};
 
   const [users, total] = await Promise.all([
     prisma.user.findMany({
       where,
       skip: (page - 1) * limit,
       take: limit,
-      select: {
-        id: true,
-        name: true,
-        email: true,
-        role: true,
-        profileImage: true,
-        isActive: true,
-        createdAt: true,
-      },
+      select: userSelect,
       orderBy: { createdAt: 'desc' },
     }),
     prisma.user.count({ where }),
@@ -104,49 +48,80 @@ const getAllUsers = async (query: { page?: number; limit?: number; search?: stri
   return { users, meta: { page, limit, total } };
 };
 
-const updateUserRole = async (userId: string, role: string) => {
-  if (!['USER', 'HOST', 'ADMIN'].includes(role)) {
-    throw new AppError(400, 'Invalid role. Allowed roles: USER, HOST, ADMIN.');
+const getUserById = async (userId: string, authUser: AuthUser) => {
+  if (authUser.role !== 'ADMIN' && authUser.id !== userId) {
+    throw new AppError(403, 'You can only view your own profile.');
   }
 
-  const user = await prisma.user.findUnique({ where: { id: userId } });
-  if (!user) {
+  const user = await prisma.user.findUnique({
+    where: { id: userId },
+    select: userSelect,
+  });
+
+  if (!user || user.isDeleted) {
     throw new AppError(404, 'User not found.');
   }
 
-  const updated = await prisma.user.update({
-    where: { id: userId },
-    data: { role: role as 'USER' | 'HOST' | 'ADMIN' },
-    select: { id: true, name: true, email: true, role: true },
-  });
-
-  return updated;
+  return user;
 };
 
-const toggleUserStatus = async (userId: string) => {
+const updateProfile = async (userId: string, authUser: AuthUser, payload: unknown) => {
+  if (authUser.id !== userId) {
+    throw new AppError(403, 'You can only update your own profile.');
+  }
+
+  const data = UserValidation.updateProfileSchema.parse(payload);
+
   const user = await prisma.user.findUnique({ where: { id: userId } });
-  if (!user) {
+  if (!user || user.isDeleted) {
     throw new AppError(404, 'User not found.');
   }
 
-  const updated = await prisma.user.update({
+  return prisma.user.update({
     where: { id: userId },
-    data: { isActive: !user.isActive },
-    select: { id: true, name: true, email: true, isActive: true },
+    data,
+    select: userSelect,
   });
-
-  return updated;
 };
 
-const refreshToken = (authUser: AuthUser) => {
-  return generateToken({ userId: authUser.id, role: authUser.role }, env.JWT_SECRET, env.JWT_EXPIRES_IN);
+const toggleBlock = async (userId: string, authUser: AuthUser) => {
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user || user.isDeleted) {
+    throw new AppError(404, 'User not found.');
+  }
+
+  if (userId === authUser.id) {
+    throw new AppError(400, 'You cannot block your own account.');
+  }
+
+  return prisma.user.update({
+    where: { id: userId },
+    data: { isBlocked: !user.isBlocked },
+    select: userSelect,
+  });
+};
+
+const deleteUser = async (userId: string, authUser: AuthUser) => {
+  const user = await prisma.user.findUnique({ where: { id: userId } });
+  if (!user || user.isDeleted) {
+    throw new AppError(404, 'User not found.');
+  }
+
+  if (userId === authUser.id) {
+    throw new AppError(400, 'You cannot delete your own account.');
+  }
+
+  return prisma.user.update({
+    where: { id: userId },
+    data: { isDeleted: true },
+    select: userSelect,
+  });
 };
 
 export const UserService = {
-  updateProfile,
-  changePassword,
   getAllUsers,
-  updateUserRole,
-  toggleUserStatus,
-  refreshToken,
+  getUserById,
+  updateProfile,
+  toggleBlock,
+  deleteUser,
 };

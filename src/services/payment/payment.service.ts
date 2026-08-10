@@ -12,23 +12,23 @@ const getStripe = () => {
   return new Stripe(env.STRIPE_SECRET_KEY);
 };
 
-const createPaymentIntentSchema = z.object({
+const createCheckoutSessionSchema = z.object({
   bookingId: z.string().min(1, 'Booking is required'),
 });
 
-const createPaymentIntent = async (
+const createCheckoutSession = async (
   authUser: AuthUser,
-  payload: z.infer<typeof createPaymentIntentSchema>
+  payload: z.infer<typeof createCheckoutSessionSchema>
 ) => {
-  const { bookingId } = createPaymentIntentSchema.parse(payload);
+  const { bookingId } = createCheckoutSessionSchema.parse(payload);
   const stripe = getStripe();
 
   const booking = await prisma.booking.findUnique({
     where: { id: bookingId },
-    include: { vehicle: true, payment: true },
+    include: { vehicle: true },
   });
 
-  if (!booking) {
+  if (!booking || booking.isDeleted) {
     throw new AppError(404, 'Booking not found.');
   }
 
@@ -36,64 +36,40 @@ const createPaymentIntent = async (
     throw new AppError(403, 'You can only pay for your own bookings.');
   }
 
-  if (booking.payment?.status === 'PAID') {
+  if (booking.paymentStatus === 'PAID') {
     throw new AppError(400, 'This booking is already paid.');
   }
 
-  const amount = Number(booking.totalAmount) + Number(booking.vehicle.securityDeposit);
+  const unitAmount = Math.round(Number(booking.totalPrice) * 100);
 
-  const paymentIntent = await stripe.paymentIntents.create({
-    amount: Math.round(amount * 100),
-    currency: 'usd',
-    metadata: { bookingId, userId: authUser.id },
-    automatic_payment_methods: { enabled: true },
+  const session = await stripe.checkout.sessions.create({
+    mode: 'payment',
+    line_items: [
+      {
+        quantity: 1,
+        price_data: {
+          currency: 'usd',
+          unit_amount: unitAmount,
+          product_data: {
+            name: booking.vehicle.name,
+          },
+        },
+      },
+    ],
+    metadata: { bookingId },
+    success_url: `${env.CLIENT_URL}/payment/success?bookingId=${bookingId}`,
+    cancel_url: `${env.CLIENT_URL}/payment/cancel?bookingId=${bookingId}`,
   });
 
-  await prisma.payment.upsert({
-    where: { bookingId },
-    update: { stripePaymentIntentId: paymentIntent.id },
-    create: {
-      bookingId,
-      userId: authUser.id,
-      amount,
-      status: 'PENDING',
-      stripePaymentIntentId: paymentIntent.id,
-    },
-  });
-
-  return {
-    clientSecret: paymentIntent.client_secret,
-    amount,
-  };
-};
-
-const confirmPayment = async (paymentIntentId: string) => {
-  const payment = await prisma.payment.findUnique({
-    where: { stripePaymentIntentId: paymentIntentId },
-  });
-
-  if (!payment) {
-    throw new AppError(404, 'Payment not found.');
-  }
-
-  if (payment.status === 'PAID') {
-    return payment;
-  }
-
-  return prisma.$transaction([
-    prisma.payment.update({
-      where: { id: payment.id },
-      data: { status: 'PAID' },
-    }),
-    prisma.booking.update({
-      where: { id: payment.bookingId },
-      data: { paymentStatus: 'PAID', status: 'CONFIRMED' },
-    }),
-  ]);
+  return { url: session.url };
 };
 
 const handleWebhook = async (rawBody: Buffer, signature: string) => {
   const stripe = getStripe();
+
+  if (!signature) {
+    throw new AppError(400, 'Missing Stripe signature.');
+  }
 
   if (!env.STRIPE_WEBHOOK_SECRET) {
     throw new AppError(500, 'Stripe webhook secret is not configured.');
@@ -101,31 +77,46 @@ const handleWebhook = async (rawBody: Buffer, signature: string) => {
 
   let event: Stripe.Event;
   try {
-    event = stripe.webhooks.constructEvent(
-      rawBody,
-      signature,
-      env.STRIPE_WEBHOOK_SECRET
-    );
+    event = stripe.webhooks.constructEvent(rawBody, signature, env.STRIPE_WEBHOOK_SECRET);
   } catch {
     throw new AppError(400, 'Invalid Stripe signature.');
   }
 
-  switch (event.type) {
-    case 'payment_intent.succeeded': {
-      const paymentIntent = event.data.object as Stripe.PaymentIntent;
-      await confirmPayment(paymentIntent.id);
-      break;
+  if (event.type === 'checkout.session.completed') {
+    const session = event.data.object as Stripe.Checkout.Session;
+    const bookingId = session.metadata?.bookingId;
+
+    if (!bookingId) {
+      return { received: true };
     }
-    case 'payment_intent.payment_failed': {
-      const paymentIntent = event.data.object as Stripe.PaymentIntent;
-      await prisma.payment.updateMany({
-        where: { stripePaymentIntentId: paymentIntent.id },
-        data: { status: 'FAILED' },
-      });
-      break;
+
+    const booking = await prisma.booking.findUnique({ where: { id: bookingId } });
+    if (!booking) {
+      return { received: true };
     }
-    default:
-      break;
+
+    await prisma.$transaction([
+      prisma.payment.upsert({
+        where: { bookingId },
+        update: { status: 'PAID', stripeSessionId: session.id },
+        create: {
+          bookingId,
+          amount: booking.totalPrice,
+          status: 'PAID',
+          stripeSessionId: session.id,
+          stripePaymentIntentId:
+            typeof session.payment_intent === 'string' ? session.payment_intent : null,
+        },
+      }),
+      prisma.booking.update({
+        where: { id: bookingId },
+        data: { paymentStatus: 'PAID', status: 'CONFIRMED' },
+      }),
+      prisma.vehicle.update({
+        where: { id: booking.vehicleId },
+        data: { status: 'BOOKED' },
+      }),
+    ]);
   }
 
   return { received: true };
@@ -141,13 +132,8 @@ const getPaymentByBooking = async (bookingId: string, authUser: AuthUser) => {
     throw new AppError(404, 'Payment not found.');
   }
 
-  const isOwner = payment.userId === authUser.id;
-  const isHost =
-    payment.booking.vehicleId &&
-    (await prisma.vehicle.findUnique({ where: { id: payment.booking.vehicleId } }))?.hostId ===
-      authUser.id;
-
-  if (!isOwner && !isHost && authUser.role !== 'ADMIN') {
+  const isOwner = payment.booking.userId === authUser.id;
+  if (!isOwner && authUser.role !== 'ADMIN') {
     throw new AppError(403, 'You are not allowed to view this payment.');
   }
 
@@ -155,8 +141,7 @@ const getPaymentByBooking = async (bookingId: string, authUser: AuthUser) => {
 };
 
 export const PaymentService = {
-  createPaymentIntent,
-  confirmPayment,
+  createCheckoutSession,
   handleWebhook,
   getPaymentByBooking,
 };

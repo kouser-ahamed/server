@@ -1,44 +1,17 @@
-import { z } from 'zod';
 import { prisma } from '../../lib/prisma';
 import AppError from '../../utils/AppError';
 import { AuthUser } from '../../middlewares/auth.middleware';
+import { ReviewValidation } from './review.validation';
 
-const createReviewSchema = z.object({
-  vehicleId: z.string().min(1, 'Vehicle is required'),
-  rating: z.coerce.number().int().min(1).max(5, 'Rating must be between 1 and 5'),
-  comment: z.string().optional(),
-});
-
-const updateReviewSchema = z.object({
-  rating: z.coerce.number().int().min(1).max(5).optional(),
-  comment: z.string().optional(),
-});
-
-const recalculateVehicleRating = async (vehicleId: string) => {
-  const agg = await prisma.review.aggregate({
-    where: { vehicleId },
-    _avg: { rating: true },
-    _count: { rating: true },
-  });
-
-  await prisma.vehicle.update({
-    where: { id: vehicleId },
-    data: {
-      rating: agg._avg.rating ?? 0,
-      ratingCount: agg._count.rating,
-    },
-  });
-};
-
-const createReview = async (authUser: AuthUser, payload: z.infer<typeof createReviewSchema>) => {
-  const data = createReviewSchema.parse(payload);
+const createReview = async (authUser: AuthUser, payload: unknown) => {
+  const data = ReviewValidation.createReviewSchema.parse(payload);
 
   const vehicle = await prisma.vehicle.findUnique({ where: { id: data.vehicleId } });
-  if (!vehicle) {
+  if (!vehicle || vehicle.isDeleted) {
     throw new AppError(404, 'Vehicle not found.');
   }
 
-  if (vehicle.hostId === authUser.id) {
+  if (vehicle.vendorId === authUser.id) {
     throw new AppError(400, 'You cannot review your own vehicle.');
   }
 
@@ -47,6 +20,7 @@ const createReview = async (authUser: AuthUser, payload: z.infer<typeof createRe
       userId: authUser.id,
       vehicleId: data.vehicleId,
       status: 'COMPLETED',
+      isDeleted: false,
     },
   });
 
@@ -62,7 +36,7 @@ const createReview = async (authUser: AuthUser, payload: z.infer<typeof createRe
     throw new AppError(409, 'You have already reviewed this vehicle.');
   }
 
-  const review = await prisma.review.create({
+  return prisma.review.create({
     data: {
       userId: authUser.id,
       vehicleId: data.vehicleId,
@@ -71,17 +45,13 @@ const createReview = async (authUser: AuthUser, payload: z.infer<typeof createRe
     },
     include: { user: { select: { id: true, name: true, profileImage: true } } },
   });
-
-  await recalculateVehicleRating(data.vehicleId);
-
-  return review;
 };
 
-const getReviewsByVehicle = async (vehicleId: string, query: { page?: number; limit?: number }) => {
-  const page = query.page ?? 1;
-  const limit = query.limit ?? 10;
+const getReviewsByVehicle = async (vehicleId: string, query: unknown) => {
+  const page = Number((query as { page?: string }).page) || 1;
+  const limit = Number((query as { limit?: string }).limit) || 10;
 
-  const where = { vehicleId };
+  const where = { vehicleId, isDeleted: false };
 
   const [reviews, total] = await Promise.all([
     prisma.review.findMany({
@@ -97,52 +67,24 @@ const getReviewsByVehicle = async (vehicleId: string, query: { page?: number; li
   return { reviews, meta: { page, limit, total } };
 };
 
-const getReviewsByUser = async (authUser: AuthUser, query: { page?: number; limit?: number }) => {
-  const page = query.page ?? 1;
-  const limit = query.limit ?? 10;
-
-  const where = { userId: authUser.id };
-
-  const [reviews, total] = await Promise.all([
-    prisma.review.findMany({
-      where,
-      skip: (page - 1) * limit,
-      take: limit,
-      include: { vehicle: { select: { id: true, title: true, images: true } } },
-      orderBy: { createdAt: 'desc' },
-    }),
-    prisma.review.count({ where }),
-  ]);
-
-  return { reviews, meta: { page, limit, total } };
-};
-
-const updateReview = async (
-  reviewId: string,
-  authUser: AuthUser,
-  payload: z.infer<typeof updateReviewSchema>
-) => {
-  const data = updateReviewSchema.parse(payload);
+const updateReview = async (reviewId: string, authUser: AuthUser, payload: unknown) => {
+  const data = ReviewValidation.updateReviewSchema.parse(payload);
 
   const review = await prisma.review.findUnique({ where: { id: reviewId } });
-  if (!review) {
+  if (!review || review.isDeleted) {
     throw new AppError(404, 'Review not found.');
   }
 
-  if (review.userId !== authUser.id && authUser.role !== 'ADMIN') {
+  if (review.userId !== authUser.id) {
     throw new AppError(403, 'You can only update your own reviews.');
   }
 
-  const updated = await prisma.review.update({ where: { id: reviewId }, data });
-
-  await recalculateVehicleRating(review.vehicleId);
-
-  return updated;
+  return prisma.review.update({ where: { id: reviewId }, data });
 };
 
 const deleteReview = async (reviewId: string, authUser: AuthUser) => {
   const review = await prisma.review.findUnique({ where: { id: reviewId } });
-  if (!review) {
+  if (!review || review.isDeleted) {
     throw new AppError(404, 'Review not found.');
   }
 
@@ -150,17 +92,15 @@ const deleteReview = async (reviewId: string, authUser: AuthUser) => {
     throw new AppError(403, 'You can only delete your own reviews.');
   }
 
-  await prisma.review.delete({ where: { id: reviewId } });
-
-  await recalculateVehicleRating(review.vehicleId);
-
-  return null;
+  return prisma.review.update({
+    where: { id: reviewId },
+    data: { isDeleted: true },
+  });
 };
 
 export const ReviewService = {
   createReview,
   getReviewsByVehicle,
-  getReviewsByUser,
   updateReview,
   deleteReview,
 };

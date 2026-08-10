@@ -1,0 +1,17 @@
+import { Router } from 'express';
+import authMiddleware from '../../middlewares/auth.middleware';
+import authorizeRoles from '../../middlewares/role.middleware';
+import { PaymentController } from './payment.controller';
+
+const router = Router();
+
+router.post('/webhook', PaymentController.handleWebhook);
+router.post(
+  '/create-checkout-session',
+  authMiddleware,
+  authorizeRoles('CUSTOMER'),
+  PaymentController.createCheckoutSession
+);
+router.get('/:bookingId', authMiddleware, PaymentController.getPaymentByBooking);
+
+export default router;

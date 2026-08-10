@@ -1,17 +1,13 @@
-import { z } from 'zod';
 import { prisma } from '../../lib/prisma';
 import AppError from '../../utils/AppError';
 import { AuthUser } from '../../middlewares/auth.middleware';
+import { WishlistValidation } from './wishlist.validation';
 
-const addToWishlistSchema = z.object({
-  vehicleId: z.string().min(1, 'Vehicle is required'),
-});
-
-const addToWishlist = async (authUser: AuthUser, payload: z.infer<typeof addToWishlistSchema>) => {
-  const { vehicleId } = addToWishlistSchema.parse(payload);
+const addToWishlist = async (authUser: AuthUser, payload: unknown) => {
+  const { vehicleId } = WishlistValidation.addToWishlistSchema.parse(payload);
 
   const vehicle = await prisma.vehicle.findUnique({ where: { id: vehicleId } });
-  if (!vehicle) {
+  if (!vehicle || vehicle.isDeleted) {
     throw new AppError(404, 'Vehicle not found.');
   }
 
@@ -29,9 +25,9 @@ const addToWishlist = async (authUser: AuthUser, payload: z.infer<typeof addToWi
   });
 };
 
-const getWishlist = async (authUser: AuthUser, query: { page?: number; limit?: number }) => {
-  const page = query.page ?? 1;
-  const limit = query.limit ?? 10;
+const getMyWishlist = async (authUser: AuthUser, query: unknown) => {
+  const page = Number((query as { page?: string }).page) || 1;
+  const limit = Number((query as { limit?: string }).limit) || 10;
 
   const where = { userId: authUser.id };
 
@@ -40,7 +36,11 @@ const getWishlist = async (authUser: AuthUser, query: { page?: number; limit?: n
       where,
       skip: (page - 1) * limit,
       take: limit,
-      include: { vehicle: { include: { category: true } } },
+      include: {
+        vehicle: {
+          include: { category: true },
+        },
+      },
       orderBy: { createdAt: 'desc' },
     }),
     prisma.wishlist.count({ where }),
@@ -55,7 +55,7 @@ const removeFromWishlist = async (wishlistId: string, authUser: AuthUser) => {
     throw new AppError(404, 'Wishlist item not found.');
   }
 
-  if (item.userId !== authUser.id && authUser.role !== 'ADMIN') {
+  if (item.userId !== authUser.id) {
     throw new AppError(403, 'You can only remove your own wishlist items.');
   }
 
@@ -64,17 +64,8 @@ const removeFromWishlist = async (wishlistId: string, authUser: AuthUser) => {
   return null;
 };
 
-const isInWishlist = async (authUser: AuthUser, vehicleId: string) => {
-  const item = await prisma.wishlist.findUnique({
-    where: { userId_vehicleId: { userId: authUser.id, vehicleId } },
-  });
-
-  return Boolean(item);
-};
-
 export const WishlistService = {
   addToWishlist,
-  getWishlist,
+  getMyWishlist,
   removeFromWishlist,
-  isInWishlist,
 };

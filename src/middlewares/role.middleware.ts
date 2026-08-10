@@ -1,7 +1,8 @@
 import { NextFunction, Request, Response } from 'express';
+import { UserRole } from '@prisma/client';
 import AppError from '../utils/AppError';
 
-const roleMiddleware = (...allowedRoles: string[]) => {
+const authorizeRoles = (...allowedRoles: UserRole[]) => {
   return (req: Request, _res: Response, next: NextFunction) => {
     const user = req.user;
 
@@ -9,7 +10,7 @@ const roleMiddleware = (...allowedRoles: string[]) => {
       throw new AppError(401, 'You are not authorized. Please login.');
     }
 
-    if (!allowedRoles.includes(user.role)) {
+    if (!allowedRoles.includes(user.role as UserRole)) {
       throw new AppError(403, `Access denied. Required role(s): ${allowedRoles.join(', ')}.`);
     }
 
@@ -17,4 +18,4 @@ const roleMiddleware = (...allowedRoles: string[]) => {
   };
 };
 
-export default roleMiddleware;
+export default authorizeRoles;

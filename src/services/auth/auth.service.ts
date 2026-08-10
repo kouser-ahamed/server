@@ -1,31 +1,42 @@
 import bcrypt from 'bcrypt';
 import { OAuth2Client } from 'google-auth-library';
-import { z } from 'zod';
 import { env } from '../../config/env';
 import { prisma } from '../../lib/prisma';
 import AppError from '../../utils/AppError';
 import generateToken from '../../utils/generateToken';
 import { AuthUser } from '../../middlewares/auth.middleware';
+import { AuthValidation } from './auth.validation';
 
-const registerSchema = z.object({
-  name: z.string().min(2, 'Name must be at least 2 characters'),
-  email: z.string().email('Invalid email address'),
-  password: z.string().min(6, 'Password must be at least 6 characters'),
-  phone: z.string().optional(),
-  role: z.enum(['USER', 'HOST']).optional(),
+const issueToken = (user: { id: string; role: string; email: string }) => {
+  return generateToken(
+    { userId: user.id, role: user.role, email: user.email },
+    env.JWT_SECRET,
+    env.JWT_EXPIRES_IN
+  );
+};
+
+const sanitizeUser = (user: {
+  id: string;
+  name: string;
+  email: string;
+  phone: string | null;
+  profileImage: string | null;
+  role: string;
+  authProvider: string;
+  createdAt: Date;
+}) => ({
+  id: user.id,
+  name: user.name,
+  email: user.email,
+  phone: user.phone,
+  profileImage: user.profileImage,
+  role: user.role,
+  authProvider: user.authProvider,
+  createdAt: user.createdAt,
 });
 
-const loginSchema = z.object({
-  email: z.string().email('Invalid email address'),
-  password: z.string().min(1, 'Password is required'),
-});
-
-const googleLoginSchema = z.object({
-  idToken: z.string().min(1, 'Google ID token is required'),
-});
-
-const register = async (payload: z.infer<typeof registerSchema>) => {
-  const data = registerSchema.parse(payload);
+const register = async (payload: unknown) => {
+  const data = AuthValidation.registerSchema.parse(payload);
 
   const existingUser = await prisma.user.findUnique({ where: { email: data.email } });
   if (existingUser) {
@@ -40,38 +51,46 @@ const register = async (payload: z.infer<typeof registerSchema>) => {
       email: data.email,
       password: hashedPassword,
       phone: data.phone,
-      role: data.role ?? 'USER',
+      role: data.role ?? 'CUSTOMER',
+      authProvider: 'credentials',
     },
     select: {
       id: true,
       name: true,
       email: true,
-      role: true,
-      profileImage: true,
       phone: true,
+      profileImage: true,
+      role: true,
+      authProvider: true,
       createdAt: true,
     },
   });
 
-  const token = generateToken(
-    { userId: user.id, role: user.role },
-    env.JWT_SECRET,
-    env.JWT_EXPIRES_IN
-  );
-
-  return { user, token };
+  return sanitizeUser(user);
 };
 
-const login = async (payload: z.infer<typeof loginSchema>) => {
-  const data = loginSchema.parse(payload);
+const login = async (payload: unknown) => {
+  const data = AuthValidation.loginSchema.parse(payload);
 
   const user = await prisma.user.findUnique({ where: { email: data.email } });
   if (!user) {
     throw new AppError(401, 'Invalid email or password.');
   }
 
+  if (user.isBlocked) {
+    throw new AppError(403, 'Your account has been blocked.');
+  }
+
+  if (user.isDeleted) {
+    throw new AppError(401, 'Invalid email or password.');
+  }
+
+  if (user.authProvider === 'google') {
+    throw new AppError(401, 'This email is registered via Google, please use Google login.');
+  }
+
   if (!user.password) {
-    throw new AppError(401, 'This account uses Google sign-in. Please login with Google.');
+    throw new AppError(401, 'Invalid email or password.');
   }
 
   const isPasswordValid = await bcrypt.compare(data.password, user.password);
@@ -79,90 +98,71 @@ const login = async (payload: z.infer<typeof loginSchema>) => {
     throw new AppError(401, 'Invalid email or password.');
   }
 
-  if (!user.isActive) {
-    throw new AppError(403, 'Your account has been deactivated.');
-  }
+  const token = issueToken({ id: user.id, role: user.role, email: user.email });
 
-  const token = generateToken(
-    { userId: user.id, role: user.role },
-    env.JWT_SECRET,
-    env.JWT_EXPIRES_IN
-  );
-
-  const safeUser = {
-    id: user.id,
-    name: user.name,
-    email: user.email,
-    role: user.role,
-    profileImage: user.profileImage,
-    phone: user.phone,
-    createdAt: user.createdAt,
-  };
-
-  return { user: safeUser, token };
+  return { user: sanitizeUser(user), token };
 };
 
-const googleLogin = async (payload: z.infer<typeof googleLoginSchema>) => {
-  const { idToken } = googleLoginSchema.parse(payload);
+const googleLogin = async (payload: unknown) => {
+  const { credential } = AuthValidation.googleLoginSchema.parse(payload);
 
   if (!env.GOOGLE_CLIENT_ID) {
     throw new AppError(500, 'Google authentication is not configured.');
   }
 
-  const client = new OAuth2Client(env.GOOGLE_CLIENT_ID, env.GOOGLE_CLIENT_SECRET);
+  const client = new OAuth2Client(env.GOOGLE_CLIENT_ID);
 
-  const ticket = await client.verifyIdToken({
-    idToken,
-    audience: env.GOOGLE_CLIENT_ID,
-  });
+  let ticket;
+  try {
+    ticket = await client.verifyIdToken({
+      idToken: credential,
+      audience: env.GOOGLE_CLIENT_ID,
+    });
+  } catch {
+    throw new AppError(401, 'Invalid or expired Google token.');
+  }
 
   const payloadFromGoogle = ticket.getPayload();
   if (!payloadFromGoogle || !payloadFromGoogle.email) {
     throw new AppError(401, 'Invalid Google token.');
   }
 
-  const { email, name, picture, sub } = payloadFromGoogle;
+  const { email, name, picture } = payloadFromGoogle;
 
   let user = await prisma.user.findUnique({ where: { email } });
+
+  if (user && user.isBlocked) {
+    throw new AppError(403, 'Your account has been blocked.');
+  }
+
+  if (user && user.isDeleted) {
+    throw new AppError(401, 'This account is no longer active.');
+  }
 
   if (!user) {
     user = await prisma.user.create({
       data: {
         name: name ?? email.split('@')[0],
         email,
+        password: null,
+        authProvider: 'google',
         profileImage: picture ?? null,
-        googleId: sub,
-        isVerified: true,
+        role: 'CUSTOMER',
       },
     });
-  } else if (!user.googleId) {
+  } else if (user.authProvider === 'credentials') {
     user = await prisma.user.update({
       where: { id: user.id },
-      data: { googleId: sub, isVerified: true },
+      data: {
+        authProvider: 'google',
+        profileImage: user.profileImage ?? picture ?? null,
+      },
     });
   }
 
-  if (!user.isActive) {
-    throw new AppError(403, 'Your account has been deactivated.');
-  }
+  const token = issueToken({ id: user.id, role: user.role, email: user.email });
 
-  const token = generateToken(
-    { userId: user.id, role: user.role },
-    env.JWT_SECRET,
-    env.JWT_EXPIRES_IN
-  );
-
-  const safeUser = {
-    id: user.id,
-    name: user.name,
-    email: user.email,
-    role: user.role,
-    profileImage: user.profileImage,
-    phone: user.phone,
-    createdAt: user.createdAt,
-  };
-
-  return { user: safeUser, token };
+  return { user: sanitizeUser(user), token };
 };
 
 const getMe = async (authUser: AuthUser) => {
@@ -172,11 +172,11 @@ const getMe = async (authUser: AuthUser) => {
       id: true,
       name: true,
       email: true,
-      role: true,
-      profileImage: true,
       phone: true,
-      address: true,
-      isVerified: true,
+      profileImage: true,
+      role: true,
+      authProvider: true,
+      isBlocked: true,
       createdAt: true,
       updatedAt: true,
     },

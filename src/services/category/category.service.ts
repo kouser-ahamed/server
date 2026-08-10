@@ -1,15 +1,9 @@
-import { z } from 'zod';
 import { prisma } from '../../lib/prisma';
 import AppError from '../../utils/AppError';
+import { CategoryValidation } from './category.validation';
 
-const categorySchema = z.object({
-  name: z.string().min(2, 'Category name must be at least 2 characters'),
-  description: z.string().optional(),
-  image: z.string().url().optional(),
-});
-
-const createCategory = async (payload: z.infer<typeof categorySchema>) => {
-  const data = categorySchema.parse(payload);
+const createCategory = async (payload: unknown) => {
+  const data = CategoryValidation.createCategorySchema.parse(payload);
 
   const existing = await prisma.category.findUnique({ where: { name: data.name } });
   if (existing) {
@@ -19,19 +13,21 @@ const createCategory = async (payload: z.infer<typeof categorySchema>) => {
   return prisma.category.create({ data });
 };
 
-const getAllCategories = async (query: { page?: number; limit?: number }) => {
-  const page = query.page ?? 1;
-  const limit = query.limit ?? 20;
+const getAllCategories = async (query: unknown) => {
+  const page = Number((query as { page?: string }).page) || 1;
+  const limit = Number((query as { limit?: string }).limit) || 20;
+
+  const where = { isDeleted: false };
 
   const [categories, total] = await Promise.all([
     prisma.category.findMany({
-      where: { isActive: true },
+      where,
       skip: (page - 1) * limit,
       take: limit,
       include: { _count: { select: { vehicles: true } } },
       orderBy: { createdAt: 'asc' },
     }),
-    prisma.category.count({ where: { isActive: true } }),
+    prisma.category.count({ where }),
   ]);
 
   return { categories, meta: { page, limit, total } };
@@ -40,21 +36,21 @@ const getAllCategories = async (query: { page?: number; limit?: number }) => {
 const getCategoryById = async (categoryId: string) => {
   const category = await prisma.category.findUnique({
     where: { id: categoryId },
-    include: { vehicles: true },
+    include: { vehicles: { where: { isDeleted: false } } },
   });
 
-  if (!category) {
+  if (!category || category.isDeleted) {
     throw new AppError(404, 'Category not found.');
   }
 
   return category;
 };
 
-const updateCategory = async (categoryId: string, payload: z.infer<typeof categorySchema>) => {
-  const data = categorySchema.partial().parse(payload);
+const updateCategory = async (categoryId: string, payload: unknown) => {
+  const data = CategoryValidation.updateCategorySchema.parse(payload);
 
   const existing = await prisma.category.findUnique({ where: { id: categoryId } });
-  if (!existing) {
+  if (!existing || existing.isDeleted) {
     throw new AppError(404, 'Category not found.');
   }
 
@@ -63,18 +59,22 @@ const updateCategory = async (categoryId: string, payload: z.infer<typeof catego
 
 const deleteCategory = async (categoryId: string) => {
   const existing = await prisma.category.findUnique({ where: { id: categoryId } });
-  if (!existing) {
+  if (!existing || existing.isDeleted) {
     throw new AppError(404, 'Category not found.');
   }
 
-  const vehicleCount = await prisma.vehicle.count({ where: { categoryId } });
+  const vehicleCount = await prisma.vehicle.count({
+    where: { categoryId, isDeleted: false },
+  });
+
   if (vehicleCount > 0) {
     throw new AppError(400, 'Cannot delete a category that still has vehicles.');
   }
 
-  await prisma.category.delete({ where: { id: categoryId } });
-
-  return null;
+  return prisma.category.update({
+    where: { id: categoryId },
+    data: { isDeleted: true },
+  });
 };
 
 export const CategoryService = {

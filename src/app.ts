@@ -19,7 +19,10 @@ app.use(
   })
 );
 
-app.use('/api/v1/payments/webhook', express.raw({ type: 'application/json' }));
+// IMPORTANT: The Stripe webhook route MUST be mounted with express.raw({ type: 'application/json' })
+// BEFORE express.json(). Stripe signs the raw request body, so if express.json() parses it first
+// the body will be an object (not a Buffer) and signature verification will fail.
+app.use('/api/payments/webhook', express.raw({ type: 'application/json' }));
 app.use(express.json());
 app.use(cookieParser());
 app.use(morgan('dev'));
@@ -33,7 +36,7 @@ app.get('/health', (_req: Request, res: Response) => {
   });
 });
 
-app.use('/api/v1', routes);
+app.use('/api', routes);
 
 app.use(notFoundMiddleware);
 app.use(errorMiddleware);
