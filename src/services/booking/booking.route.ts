@@ -11,8 +11,9 @@ router.get('/', authMiddleware, authorizeRoles('ADMIN'), BookingController.getAl
 router.get('/:id', authMiddleware, BookingController.getBookingById);
 
 router.post('/', authMiddleware, authorizeRoles('CUSTOMER'), BookingController.createBooking);
+router.patch('/:id', authMiddleware, BookingController.updateBookingDetails);
 router.patch('/:id/status', authMiddleware, authorizeRoles('VENDOR', 'ADMIN'), BookingController.updateBookingStatus);
 router.patch('/:id/cancel', authMiddleware, authorizeRoles('CUSTOMER'), BookingController.cancelBooking);
-router.delete('/:id', authMiddleware, authorizeRoles('ADMIN'), BookingController.deleteBooking);
+router.delete('/:id', authMiddleware, authorizeRoles('ADMIN', 'VENDOR'), BookingController.deleteBooking);
 
 export default router;

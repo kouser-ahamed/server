@@ -6,6 +6,11 @@ const createBookingSchema = z.object({
   endDate: z.coerce.date(),
 });
 
+const updateBookingDatesSchema = z.object({
+  startDate: z.coerce.date().refine((d) => d >= new Date(), 'Start date must be in the future'),
+  endDate: z.coerce.date(),
+});
+
 const updateStatusSchema = z.object({
   status: z.enum(['CONFIRMED', 'REJECTED']),
 });
@@ -13,11 +18,12 @@ const updateStatusSchema = z.object({
 const listBookingsQuerySchema = z.object({
   page: z.coerce.number().int().positive().optional(),
   limit: z.coerce.number().int().positive().optional(),
-  status: z.enum(['PENDING', 'CONFIRMED', 'ONGOING', 'COMPLETED', 'CANCELLED', 'REJECTED']).optional(),
+  status: z.enum(['PENDING', 'CONFIRMED', 'REJECTED', 'CANCELLED']).optional(),
 });
 
 export const BookingValidation = {
   createBookingSchema,
+  updateBookingDatesSchema,
   updateStatusSchema,
   listBookingsQuerySchema,
 };

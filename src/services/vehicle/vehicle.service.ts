@@ -153,7 +153,7 @@ const deleteVehicle = async (vehicleId: string, authUser: AuthUser) => {
   }
 
   const activeBookings = await prisma.booking.count({
-    where: { vehicleId, status: { in: ['PENDING', 'CONFIRMED', 'ONGOING'] } },
+    where: { vehicleId, status: { in: ['PENDING', 'CONFIRMED'] } },
   });
 
   if (activeBookings > 0) {

@@ -19,7 +19,8 @@ const createReview = async (authUser: AuthUser, payload: unknown) => {
     where: {
       userId: authUser.id,
       vehicleId: data.vehicleId,
-      status: 'COMPLETED',
+      paymentStatus: 'PAID',
+      endDate: { lt: new Date() },
       isDeleted: false,
     },
   });

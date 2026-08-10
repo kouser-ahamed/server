@@ -63,7 +63,7 @@ const getCustomerStats = async (authUser: AuthUser) => {
   const [totalBookings, activeBookings, spentAgg, wishlistCount] = await Promise.all([
     prisma.booking.count({ where: { userId: authUser.id, isDeleted: false } }),
     prisma.booking.count({
-      where: { userId: authUser.id, isDeleted: false, status: { in: ['CONFIRMED', 'ONGOING'] } },
+      where: { userId: authUser.id, isDeleted: false, status: 'CONFIRMED' },
     }),
     prisma.booking.aggregate({
       _sum: { totalPrice: true },

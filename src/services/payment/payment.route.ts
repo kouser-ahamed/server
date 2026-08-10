@@ -5,7 +5,6 @@ import { PaymentController } from './payment.controller';
 
 const router = Router();
 
-router.post('/webhook', PaymentController.handleWebhook);
 router.post(
   '/create-checkout-session',
   authMiddleware,

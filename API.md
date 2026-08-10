@@ -500,7 +500,7 @@ Base path: `/api/bookings`
 Lists the logged-in customer's bookings (paginated). Customer only.
 
 - **Auth**: Required — role `CUSTOMER`
-- **Query params**: `page`, `limit` (default `10`), `status` (`PENDING` | `CONFIRMED` | `ONGOING` | `COMPLETED` | `CANCELLED` | `REJECTED`)
+- **Query params**: `page`, `limit` (default `10`), `status` (`PENDING` | `CONFIRMED` | `REJECTED` | `CANCELLED`)
 - **Request body**: none
 - **Success (200 OK)**:
   ```json
@@ -517,6 +517,7 @@ Lists the logged-in customer's bookings (paginated). Customer only.
         "totalPrice": "600.00",
         "status": "PENDING",
         "paymentStatus": "UNPAID",
+        "paymentIntentId": null,
         "isDeleted": false,
         "createdAt": "2026-08-10T00:00:00.000Z",
         "updatedAt": "2026-08-10T00:00:00.000Z",
@@ -568,6 +569,7 @@ Gets a single booking. Accessible to the booking owner, the vehicle's vendor, or
       "totalPrice": "600.00",
       "status": "PENDING",
       "paymentStatus": "UNPAID",
+      "paymentIntentId": null,
       "isDeleted": false,
       "createdAt": "2026-08-10T00:00:00.000Z",
       "updatedAt": "2026-08-10T00:00:00.000Z",
@@ -580,7 +582,7 @@ Gets a single booking. Accessible to the booking owner, the vehicle's vendor, or
 
 ### POST /api/bookings
 
-Creates a booking for a vehicle. Customer only. `totalPrice` is computed as `pricePerDay × days`.
+Creates a booking for a vehicle. Customer only. `totalPrice` is computed as `pricePerDay × days`. The booking is created with `status: "PENDING"` and `paymentStatus: "UNPAID"`. Kept for backward compatibility — new checkouts should use `POST /api/payments/create-checkout-session`, which creates the booking and the Stripe Checkout session together.
 
 - **Auth**: Required — role `CUSTOMER`
 - **Request body**:
@@ -605,6 +607,7 @@ Creates a booking for a vehicle. Customer only. `totalPrice` is computed as `pri
       "totalPrice": "600.00",
       "status": "PENDING",
       "paymentStatus": "UNPAID",
+      "paymentIntentId": null,
       "isDeleted": false,
       "createdAt": "2026-08-10T00:00:00.000Z",
       "updatedAt": "2026-08-10T00:00:00.000Z",
@@ -624,26 +627,41 @@ Confirms or rejects a pending booking. Vendor or admin (vendors may only manage 
   { "status": "CONFIRMED" }
   ```
   `status` is `CONFIRMED` | `REJECTED`.
-- **Success (200 OK)**: `message: "Booking status updated successfully"`, `data` = updated booking object. Confirming sets `vehicle.status = BOOKED`; rejecting releases the vehicle if free.
-- **Errors**: `400` (booking is not `PENDING`), `401`, `403` (not the vendor of the vehicle), `404`, `409` (overlapping booking on confirm)
+- **Rules**:
+  - `CONFIRMED`: only when `status: "PENDING"` and `paymentStatus: "PAID"`. Sets `vehicle.status = BOOKED`.
+  - `REJECTED`: only when `status: "PENDING"`. If the customer paid, the Stripe payment is refunded first (via the stored `paymentIntentId`); the booking is only marked `REJECTED` once the refund succeeds. An unpaid booking is rejected without a refund and stays `UNPAID`.
+- **Success (200 OK)**: `message: "Booking status updated successfully"`, `data` = updated booking object.
+- **Errors**: `400` (booking is not `PENDING`; confirm on an unpaid booking), `401`, `403` (not the vendor of the vehicle), `404`, `409` (overlapping booking on confirm), `502` (refund failed on reject — booking is NOT rejected)
+
+### PATCH /api/bookings/:id
+
+Edits the rental dates of a pending booking and recomputes `totalPrice`. Accessible to the booking's own customer or the vendor who owns the vehicle.
+
+- **Auth**: Required (owner customer or vehicle vendor)
+- **Request body**:
+  ```json
+  { "startDate": "2026-09-02", "endDate": "2026-09-06" }
+  ```
+- **Success (200 OK)**: `message: "Booking updated successfully"`, `data` = updated booking object.
+- **Errors**: `400` (invalid dates / booking is not `PENDING`), `401`, `403` (not owner/vendor), `404`, `409` (dates overlap with an existing booking)
 
 ### PATCH /api/bookings/:id/cancel
 
-Cancels the customer's own pending or confirmed booking.
+Cancels the customer's own pending booking. If the customer has already paid, the Stripe payment is refunded first; the booking is only cancelled once the refund succeeds.
 
 - **Auth**: Required — role `CUSTOMER`
 - **Request body**: none
 - **Success (200 OK)**: `message: "Booking cancelled successfully"`, `data` = updated booking object (`status: "CANCELLED"`). Vehicle is released if it has no other active bookings.
-- **Errors**: `400` (booking is not `PENDING`/`CONFIRMED`), `401`, `403` (not your booking), `404`
+- **Errors**: `400` (booking is not `PENDING`), `401`, `403` (not your booking), `404`, `502` (refund failed on cancel)
 
 ### DELETE /api/bookings/:id
 
-Soft-deletes a booking. Admin only.
+Soft-deletes a booking. Admin or the vendor who owns the vehicle.
 
-- **Auth**: Required — role `ADMIN`
+- **Auth**: Required — role `ADMIN` or `VENDOR`
 - **Request body**: none
 - **Success (200 OK)**: `message: "Booking deleted successfully"`, `data` = updated booking object (`isDeleted: true`). Vehicle is released if free.
-- **Errors**: `401`, `403`, `404`
+- **Errors**: `401`, `403` (not admin and not the vehicle's vendor), `404`
 
 ---
 
@@ -683,7 +701,7 @@ Lists reviews for a vehicle (paginated). Public.
 
 ### POST /api/reviews
 
-Creates a review. The customer must have a `COMPLETED` booking for the vehicle, and can only review once. Customer only.
+Creates a review. The customer must have a paid booking for the vehicle whose rental period (`endDate`) has already passed, and can only review once. Customer only.
 
 - **Auth**: Required — role `CUSTOMER`
 - **Request body**:
@@ -815,10 +833,21 @@ Base path: `/api/payments`
 
 ### POST /api/payments/create-checkout-session
 
-Creates a Stripe Checkout session for an unpaid booking owned by the customer. Returns the hosted checkout URL.
+Creates a Stripe Checkout session and returns the hosted checkout URL. Two modes:
+
+1. **New booking + checkout (checkout-initiation)**: pass `vehicleId`, `startDate`, `endDate`. The booking is created immediately with `status: "PENDING"` and `paymentStatus: "UNPAID"`, a `UNPAID` payment row is recorded, and the customer is redirected straight to Stripe in the same request.
+2. **Retry (Pay Now)**: pass an existing `bookingId`. Used for abandoned/failed checkouts on a `pending`/`UNPAID` booking.
 
 - **Auth**: Required — role `CUSTOMER`
 - **Request body**:
+  ```json
+  {
+    "vehicleId": "uuid",
+    "startDate": "2026-09-01",
+    "endDate": "2026-09-05"
+  }
+  ```
+  or
   ```json
   { "bookingId": "uuid" }
   ```
@@ -827,15 +856,18 @@ Creates a Stripe Checkout session for an unpaid booking owned by the customer. R
   {
     "success": true,
     "message": "Checkout session created successfully",
-    "data": { "url": "https://checkout.stripe.com/c/pay/cs_test_..." }
+    "data": {
+      "url": "https://checkout.stripe.com/c/pay/cs_test_...",
+      "bookingId": "uuid"
+    }
   }
   ```
   On success Stripe redirects to `{CLIENT_URL}/payment/success?bookingId={bookingId}`, or on cancel to `{CLIENT_URL}/payment/cancel?bookingId={bookingId}`.
-- **Errors**: `400` (validation / booking already paid), `401`, `403` (not the booking owner), `404` (booking not found), `500` (Stripe not configured)
+- **Errors**: `400` (validation / booking already paid / no bookingId or vehicle details), `401`, `403` (not the booking owner), `404` (booking/vehicle not found), `409` (dates overlap), `500` (Stripe not configured)
 
 ### POST /api/payments/webhook
 
-Stripe webhook endpoint. Must be called by Stripe with the `stripe-signature` header; the raw JSON body is verified with `STRIPE_WEBHOOK_SECRET`. On `checkout.session.completed` it marks the payment as `PAID`, sets the booking to `CONFIRMED`/`PAID`, and sets the vehicle to `BOOKED`.
+Stripe webhook endpoint. Must be called by Stripe with the `stripe-signature` header; the raw JSON body is verified with `STRIPE_WEBHOOK_SECRET`. On `checkout.session.completed` it marks `booking.paymentStatus = "PAID"`, stores the Stripe `paymentIntentId` on the booking (and the payment row) for future refunds. The booking `status` stays `PENDING` awaiting vendor action.
 
 - **Auth**: None (verified via Stripe signature header)
 - **Headers**: `stripe-signature: <sig>`
