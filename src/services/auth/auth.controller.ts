@@ -69,10 +69,22 @@ const logout = catchAsync(async (_req: Request, res: Response) => {
   });
 });
 
+const changePassword = catchAsync(async (req: Request, res: Response) => {
+  await AuthService.changePassword(req.user!, req.body);
+
+  sendResponse(res, {
+    success: true,
+    statusCode: 200,
+    message: 'Password updated successfully',
+    data: null,
+  });
+});
+
 export const AuthController = {
   register,
   login,
   googleLogin,
   getMe,
   logout,
+  changePassword,
 };

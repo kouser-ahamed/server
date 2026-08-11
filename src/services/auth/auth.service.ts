@@ -189,9 +189,41 @@ const getMe = async (authUser: AuthUser) => {
   return user;
 };
 
+const changePassword = async (authUser: AuthUser, payload: unknown) => {
+  const data = AuthValidation.changePasswordSchema.parse(payload);
+
+  const user = await prisma.user.findUnique({
+    where: { id: authUser.id },
+    select: { id: true, password: true, isDeleted: true, authProvider: true },
+  });
+
+  if (!user || user.isDeleted) {
+    throw new AppError(404, 'User not found.');
+  }
+
+  if (user.authProvider === 'google' || !user.password) {
+    throw new AppError(400, 'Your account does not have a password set.');
+  }
+
+  const isPasswordValid = await bcrypt.compare(data.currentPassword, user.password);
+  if (!isPasswordValid) {
+    throw new AppError(400, 'Current password is incorrect.');
+  }
+
+  const hashedPassword = await bcrypt.hash(data.newPassword, env.BCRYPT_SALT_ROUNDS);
+
+  await prisma.user.update({
+    where: { id: authUser.id },
+    data: { password: hashedPassword },
+  });
+
+  return null;
+};
+
 export const AuthService = {
   register,
   login,
   googleLogin,
   getMe,
+  changePassword,
 };
