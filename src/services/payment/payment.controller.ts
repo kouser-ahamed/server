@@ -14,11 +14,15 @@ const createCheckoutSession = catchAsync(async (req: Request, res: Response) => 
   });
 });
 
-const handleWebhook = catchAsync(async (req: Request, res: Response) => {
-  const signature = req.headers['stripe-signature'] as string;
-  const result = await PaymentService.handleWebhook(req.body as Buffer, signature);
+const verifySession = catchAsync(async (req: Request, res: Response) => {
+  const result = await PaymentService.verifySession(req.user!, req.body);
 
-  res.status(200).json(result);
+  sendResponse(res, {
+    success: true,
+    statusCode: 200,
+    message: 'Payment verified successfully',
+    data: result,
+  });
 });
 
 const getPaymentByBooking = catchAsync(async (req: Request, res: Response) => {
@@ -34,6 +38,6 @@ const getPaymentByBooking = catchAsync(async (req: Request, res: Response) => {
 
 export const PaymentController = {
   createCheckoutSession,
-  handleWebhook,
+  verifySession,
   getPaymentByBooking,
 };

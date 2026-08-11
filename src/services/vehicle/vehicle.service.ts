@@ -1,4 +1,4 @@
-import { Prisma } from '@prisma/client';
+import { Prisma, Vehicle } from '@prisma/client';
 import { prisma } from '../../lib/prisma';
 import AppError from '../../utils/AppError';
 import { AuthUser } from '../../middlewares/auth.middleware';
@@ -26,6 +26,20 @@ const createVehicle = async (authUser: AuthUser, payload: unknown) => {
       location: data.location,
     },
     include: { category: true },
+  });
+};
+
+// Attaches averageRating and reviewCount to a list of vehicles based on their
+// non-deleted reviews.
+const enrichVehiclesWithRating = (vehicles: (Vehicle & { reviews: { rating: number }[] })[]) => {
+  return vehicles.map((vehicle) => {
+    const { reviews, ...rest } = vehicle;
+    const reviewCount = reviews.length;
+    const averageRating = reviewCount
+      ? +(reviews.reduce((sum, review) => sum + review.rating, 0) / reviewCount).toFixed(2)
+      : 0;
+
+    return { ...rest, averageRating, reviewCount };
   });
 };
 
@@ -62,13 +76,16 @@ const getAllVehicles = async (query: unknown) => {
       where,
       skip: (page - 1) * limit,
       take: limit,
-      include: { category: true },
+      include: {
+        category: true,
+        reviews: { where: { isDeleted: false }, select: { rating: true } },
+      },
       orderBy,
     }),
     prisma.vehicle.count({ where }),
   ]);
 
-  return { vehicles, meta: { page, limit, total } };
+  return { vehicles: enrichVehiclesWithRating(vehicles), meta: { page, limit, total } };
 };
 
 const getVehicleById = async (vehicleId: string) => {
@@ -118,13 +135,17 @@ const getMyVehicles = async (authUser: AuthUser, query: unknown) => {
       where,
       skip: (page - 1) * limit,
       take: limit,
-      include: { category: true, _count: { select: { bookings: true } } },
+      include: {
+        category: true,
+        _count: { select: { bookings: true } },
+        reviews: { where: { isDeleted: false }, select: { rating: true } },
+      },
       orderBy: { createdAt: 'desc' },
     }),
     prisma.vehicle.count({ where }),
   ]);
 
-  return { vehicles, meta: { page, limit, total } };
+  return { vehicles: enrichVehiclesWithRating(vehicles), meta: { page, limit, total } };
 };
 
 const updateVehicle = async (vehicleId: string, authUser: AuthUser, payload: unknown) => {

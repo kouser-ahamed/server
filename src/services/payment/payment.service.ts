@@ -22,6 +22,10 @@ const createCheckoutSessionSchema = z.object({
   endDate: z.coerce.date().optional(),
 });
 
+const verifySessionSchema = z.object({
+  session_id: z.string().min(1, 'session_id is required'),
+});
+
 const resolveBooking = async (
   authUser: AuthUser,
   payload: z.infer<typeof createCheckoutSessionSchema>
@@ -89,13 +93,16 @@ const createCheckoutSession = async (
       },
     ],
     metadata: { bookingId: booking.id },
-    success_url: `${env.CLIENT_URL}/payment/success?bookingId=${booking.id}`,
+    // {CHECKOUT_SESSION_ID} is replaced by Stripe with the real session id on
+    // redirect, so the success page can verify the payment directly without a
+    // webhook. bookingId is kept for display links / fallback.
+    success_url: `${env.CLIENT_URL}/payment/success?bookingId=${booking.id}&session_id={CHECKOUT_SESSION_ID}`,
     cancel_url: `${env.CLIENT_URL}/payment/cancel?bookingId=${booking.id}`,
   });
 
-  // Create a UNPAID payment row up front so the success page has a record to
-  // poll immediately after Stripe redirects the customer. The webhook updates
-  // this row to PAID when the checkout session completes.
+  // Create a UNPAID payment row up front so the session has a persisted
+  // stripeSessionId to look up in verify-session. The verify endpoint flips it
+  // to PAID once the customer returns from Stripe.
   await prisma.payment.upsert({
     where: { bookingId: booking.id },
     update: {
@@ -114,50 +121,67 @@ const createCheckoutSession = async (
   return { url: session.url, bookingId: booking.id };
 };
 
-const handleWebhook = async (rawBody: Buffer, signature: string) => {
+const getPaymentIntentId = (session: Stripe.Checkout.Session): string | null => {
+  if (typeof session.payment_intent === 'string') {
+    return session.payment_intent;
+  }
+  return session.payment_intent?.id ?? null;
+};
+
+// Direct verification of a Checkout Session — replaces the Stripe webhook. The
+// customer lands on the success page with the real session id in the URL and
+// this endpoint asks Stripe directly whether the payment completed, then flips
+// the booking to PAID. No webhook, no signature, no STRIPE_WEBHOOK_SECRET, and
+// it works identically in local dev and in production.
+//
+// Idempotent: verifying an already-PAID booking is a no-op that returns the
+// current state, and an already-REFUNDED booking is never regressed.
+const verifySession = async (authUser: AuthUser, payload: unknown) => {
+  const { session_id } = verifySessionSchema.parse(payload);
   const stripe = getStripe();
 
-  if (!signature) {
-    throw new AppError(400, 'Missing Stripe signature.');
+  const session = await stripe.checkout.sessions.retrieve(session_id, {
+    expand: ['payment_intent'],
+  });
+
+  // Resolve the booking for this session. Prefer the metadata we stamped at
+  // session creation, falling back to the UNPAID payment row stored with the
+  // same stripeSessionId.
+  const booking =
+    session.metadata?.bookingId
+      ? await prisma.booking.findUnique({ where: { id: session.metadata.bookingId } })
+      : await prisma.booking.findFirst({
+          where: { payment: { stripeSessionId: session_id } },
+        });
+
+  if (!booking || booking.isDeleted) {
+    throw new AppError(404, 'No booking found for this payment session.');
   }
 
-  if (!env.STRIPE_WEBHOOK_SECRET) {
-    throw new AppError(500, 'Stripe webhook secret is not configured.');
+  if (booking.userId !== authUser.id && authUser.role !== 'ADMIN') {
+    throw new AppError(403, 'You can only verify payments for your own bookings.');
   }
 
-  let event: Stripe.Event;
-  try {
-    event = stripe.webhooks.constructEvent(rawBody, signature, env.STRIPE_WEBHOOK_SECRET);
-  } catch (err) {
-    throw new AppError(400, `Invalid Stripe signature: ${(err as Error).message}`);
+  const paymentIntentId = getPaymentIntentId(session);
+  const paidOnStripe = session.payment_status === 'paid';
+
+  // Idempotent: nothing to do if the booking is already settled.
+  if (booking.paymentStatus === 'PAID' || booking.paymentStatus === 'REFUNDED') {
+    const current = await prisma.booking.findUnique({
+      where: { id: booking.id },
+      include: { vehicle: { select: { name: true } } },
+    });
+    return { paid: booking.paymentStatus === 'PAID', booking: current };
   }
 
-  if (event.type === 'checkout.session.completed') {
-    const session = event.data.object as Stripe.Checkout.Session;
-    const bookingId = session.metadata?.bookingId;
-
-    if (!bookingId) {
-      return { received: true };
-    }
-
-    const booking = await prisma.booking.findUnique({ where: { id: bookingId } });
-    if (!booking) {
-      return { received: true };
-    }
-
-    const paymentIntentId =
-      typeof session.payment_intent === 'string'
-        ? session.payment_intent
-        : session.payment_intent?.id ?? null;
-
+  if (paidOnStripe) {
     // Payment succeeded: this is a PAYMENT status update only. Mark the booking
     // as PAID and persist the Stripe payment_intent id on the booking record so
     // a later refund can be triggered. The BOOKING status stays PENDING
-    // (awaiting vendor action) — it is never auto-confirmed, and a late or
-    // replayed webhook never regresses a booking.
+    // (awaiting vendor action) — it is never auto-confirmed.
     await prisma.$transaction([
       prisma.booking.update({
-        where: { id: bookingId },
+        where: { id: booking.id },
         data: {
           paymentStatus: 'PAID',
           ...(paymentIntentId && !booking.paymentIntentId
@@ -166,24 +190,29 @@ const handleWebhook = async (rawBody: Buffer, signature: string) => {
         },
       }),
       prisma.payment.upsert({
-        where: { bookingId },
+        where: { bookingId: booking.id },
         update: {
           status: 'PAID',
-          stripeSessionId: session.id,
-          stripePaymentIntentId: paymentIntentId,
+          stripeSessionId: session_id,
+          ...(paymentIntentId ? { stripePaymentIntentId: paymentIntentId } : {}),
         },
         create: {
-          bookingId,
+          bookingId: booking.id,
           amount: booking.totalPrice,
           status: 'PAID',
-          stripeSessionId: session.id,
+          stripeSessionId: session_id,
           stripePaymentIntentId: paymentIntentId,
         },
       }),
     ]);
   }
 
-  return { received: true };
+  const updated = await prisma.booking.findUnique({
+    where: { id: booking.id },
+    include: { vehicle: { select: { name: true } } },
+  });
+
+  return { paid: paidOnStripe, booking: updated };
 };
 
 const getPaymentByBooking = async (bookingId: string, authUser: AuthUser) => {
@@ -206,6 +235,6 @@ const getPaymentByBooking = async (bookingId: string, authUser: AuthUser) => {
 
 export const PaymentService = {
   createCheckoutSession,
-  handleWebhook,
+  verifySession,
   getPaymentByBooking,
 };

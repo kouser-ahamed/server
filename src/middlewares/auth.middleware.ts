@@ -32,27 +32,43 @@ const getTokenFromRequest = (req: Request): string | undefined => {
   return req.cookies?.token as string | undefined;
 };
 
-const authMiddleware = catchAsync(async (req: Request, _res: Response, next: NextFunction) => {
+const resolveUserFromRequest = (req: Request): AuthUser | undefined => {
   const token = getTokenFromRequest(req);
-
   if (!token) {
+    return undefined;
+  }
+
+  try {
+    const decoded = jwt.verify(token, env.JWT_SECRET) as JWTPayload;
+    return {
+      id: decoded.userId,
+      role: decoded.role,
+      email: decoded.email,
+    };
+  } catch {
+    return undefined;
+  }
+};
+
+const authMiddleware = catchAsync(async (req: Request, _res: Response, next: NextFunction) => {
+  const user = resolveUserFromRequest(req);
+
+  if (!user) {
     throw new AppError(401, 'You are not authorized. Please login.');
   }
 
-  let decoded: JWTPayload;
-  try {
-    decoded = jwt.verify(token, env.JWT_SECRET) as JWTPayload;
-  } catch {
-    throw new AppError(401, 'Invalid or expired token. Please login again.');
-  }
-
-  req.user = {
-    id: decoded.userId,
-    role: decoded.role,
-    email: decoded.email,
-  };
+  req.user = user;
 
   next();
 });
 
+// Attaches the user when a valid token is present, but never rejects the
+// request. Used on public read endpoints that enrich their payload with the
+// current user's own state (e.g. the logged-in customer's reaction on a review).
+const optionalAuthMiddleware = (req: Request, _res: Response, next: NextFunction) => {
+  req.user = resolveUserFromRequest(req);
+  next();
+};
+
 export default authMiddleware;
+export { optionalAuthMiddleware };

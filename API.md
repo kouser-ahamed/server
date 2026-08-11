@@ -2,7 +2,7 @@
 
 Base URL: `http://localhost:5000/api`
 
-- All JSON request/response bodies use the `Content-Type: application/json` header (except the Stripe webhook, which uses raw JSON).
+- All JSON request/response bodies use the `Content-Type: application/json` header.
 - **Authentication**: Send the JWT either as a Bearer token in the `Authorization` header (`Authorization: Bearer <token>`) or as an `httpOnly` cookie named `token` (set automatically on login/google-login).
 - **Success response shape**:
   ```json
@@ -669,11 +669,17 @@ Soft-deletes a booking. Admin or the vendor who owns the vehicle.
 
 Base path: `/api/reviews`
 
+A review can have a single vendor reply (owned by the vendor who owns the vehicle) and any
+number of like/dislike reactions. A user can react at most once per review (unique constraint on
+`reviewId + userId`): clicking the same reaction again toggles it off, clicking the other
+reaction switches it. Admin can only moderate (delete) reactions — never create or change them.
+
 ### GET /api/reviews/vehicle/:vehicleId
 
-Lists reviews for a vehicle (paginated). Public.
+Lists reviews for a vehicle (paginated). Public (optionally authenticated: when a valid token is
+sent, each review includes the caller's own reaction state).
 
-- **Auth**: None
+- **Auth**: None (or optional valid token)
 - **Query params**: `page`, `limit` (default `10`)
 - **Request body**: none
 - **Success (200 OK)**:
@@ -691,7 +697,19 @@ Lists reviews for a vehicle (paginated). Public.
         "isDeleted": false,
         "createdAt": "2026-08-10T00:00:00.000Z",
         "updatedAt": "2026-08-10T00:00:00.000Z",
-        "user": { "id": "uuid", "name": "John Doe", "profileImage": null }
+        "user": { "id": "uuid", "name": "John Doe", "profileImage": null },
+        "reply": {
+          "id": "uuid",
+          "reviewId": "uuid",
+          "vendorId": "uuid",
+          "content": "Thanks for the feedback!",
+          "createdAt": "2026-08-11T00:00:00.000Z",
+          "updatedAt": "2026-08-11T00:00:00.000Z",
+          "vendor": { "id": "uuid", "name": "Vendor Name" }
+        },
+        "likeCount": 3,
+        "dislikeCount": 1,
+        "myReaction": { "id": "uuid", "type": "LIKE" }
       }
     ],
     "meta": { "page": 1, "limit": 10, "total": 1 }
@@ -699,9 +717,31 @@ Lists reviews for a vehicle (paginated). Public.
   ```
 - **Errors**: `400`, `500`
 
+### GET /api/reviews
+
+Lists all reviews across the platform (paginated), with the customer, vehicle, reply, and the
+full reaction list (including who reacted). Admin only.
+
+- **Auth**: Required — role `ADMIN`
+- **Query params**: `page`, `limit` (default `10`)
+- **Request body**: none
+- **Success (200 OK)**: `message: "Reviews retrieved successfully"`, `data` = reviews (each
+  includes `user`, `vehicle`, `reply`, `reactions`, `likeCount`, `dislikeCount`), plus `meta`.
+- **Errors**: `400`, `401`, `403`
+
+### GET /api/reviews/:id
+
+Gets a single review with full detail (customer, vehicle, reply, reactions, counts). Admin only.
+
+- **Auth**: Required — role `ADMIN`
+- **Request body**: none
+- **Success (200 OK)**: `message: "Review retrieved successfully"`, `data` = one review object.
+- **Errors**: `401`, `403`, `404`
+
 ### POST /api/reviews
 
-Creates a review. The customer must have a paid booking for the vehicle whose rental period (`endDate`) has already passed, and can only review once. Customer only.
+Creates a review. The customer must have a paid booking for the vehicle whose rental period
+(`endDate`) has already passed, and can only review once. Customer only.
 
 - **Auth**: Required — role `CUSTOMER`
 - **Request body**:
@@ -723,7 +763,11 @@ Creates a review. The customer must have a paid booking for the vehicle whose re
       "isDeleted": false,
       "createdAt": "2026-08-10T00:00:00.000Z",
       "updatedAt": "2026-08-10T00:00:00.000Z",
-      "user": { "id": "uuid", "name": "John Doe", "profileImage": null }
+      "user": { "id": "uuid", "name": "John Doe", "profileImage": null },
+      "reply": null,
+      "likeCount": 0,
+      "dislikeCount": 0,
+      "myReaction": null
     }
   }
   ```
@@ -731,15 +775,15 @@ Creates a review. The customer must have a paid booking for the vehicle whose re
 
 ### PATCH /api/reviews/:id
 
-Updates the user's own review.
+Updates a review's rating/comment. Allowed for the review author or an admin.
 
-- **Auth**: Required (own review only)
+- **Auth**: Required (own review or `ADMIN`)
 - **Request body** (all optional):
   ```json
   { "rating": 4, "comment": "Updated comment" }
   ```
 - **Success (200 OK)**: `message: "Review updated successfully"`, `data` = updated review object.
-- **Errors**: `400`, `401`, `403` (not your review), `404`
+- **Errors**: `400`, `401`, `403` (not your review / not admin), `404`
 
 ### DELETE /api/reviews/:id
 
@@ -749,6 +793,77 @@ Soft-deletes a review. The review author or an admin can delete.
 - **Request body**: none
 - **Success (200 OK)**: `message: "Review deleted successfully"`, `data` = updated review object (`isDeleted: true`).
 - **Errors**: `401`, `403`, `404`
+
+### POST /api/reviews/:id/reply
+
+Replies to a review. Only the vendor who owns the vehicle can reply, and only once per review.
+
+- **Auth**: Required — role `VENDOR`
+- **Request body**:
+  ```json
+  { "content": "Thanks for the feedback!" }
+  ```
+- **Success (201 Created)**: `message: "Reply submitted successfully"`, `data` = created reply object.
+- **Errors**: `400` (empty reply), `401`, `403` (not the vehicle's vendor), `404` (review not found), `409` (already replied)
+
+### PATCH /api/reviews/:id/reply
+
+Edits the vendor's own reply on a review.
+
+- **Auth**: Required — role `VENDOR` (must own the reply and the vehicle)
+- **Request body**:
+  ```json
+  { "content": "Updated reply" }
+  ```
+- **Success (200 OK)**: `message: "Reply updated successfully"`, `data` = updated reply object.
+- **Errors**: `400`, `401`, `403`, `404`
+
+### DELETE /api/reviews/:id/reply
+
+Deletes a vendor reply. The reply's vendor (who also owns the vehicle) or an admin can delete.
+
+- **Auth**: Required — role `VENDOR` or `ADMIN`
+- **Request body**: none
+- **Success (200 OK)**: `message: "Reply deleted successfully"`, `data` = `null`.
+- **Errors**: `401`, `403`, `404`
+
+### POST /api/reviews/:id/react
+
+Likes or dislikes a review (toggle/switch). Applying the same type the user already has removes
+it (toggle off); applying the other type switches it (replace, never both). Enforced atomically
+(unique constraint on `reviewId + userId`, serializable transaction). The caller cannot react to
+their own review. Customer only.
+
+- **Auth**: Required — role `CUSTOMER`
+- **Request body**:
+  ```json
+  { "type": "LIKE" }
+  ```
+  `type` is `LIKE` | `DISLIKE`.
+- **Success (200 OK)**:
+  ```json
+  {
+    "success": true,
+    "message": "Reaction updated successfully",
+    "data": {
+      "reaction": { "id": "uuid", "type": "LIKE" },
+      "likeCount": 4,
+      "dislikeCount": 1
+    }
+  }
+  ```
+  `reaction` is `null` when the reaction was toggled off.
+- **Errors**: `400` (invalid type / cannot react to your own review), `401`, `403`, `404` (review not found)
+
+### DELETE /api/reviews/reactions/:reactionId
+
+Deletes a single like/dislike reaction (moderation — e.g. spam/bot removal). Admin cannot create
+or change reactions, only delete them. Distinct from the owner's react endpoint. Admin only.
+
+- **Auth**: Required — role `ADMIN`
+- **Request body**: none
+- **Success (200 OK)**: `message: "Reaction deleted successfully"`, `data` = `null`.
+- **Errors**: `401`, `403`, `404` (reaction not found)
 
 ---
 
@@ -862,21 +977,36 @@ Creates a Stripe Checkout session and returns the hosted checkout URL. Two modes
     }
   }
   ```
-  On success Stripe redirects to `{CLIENT_URL}/payment/success?bookingId={bookingId}`, or on cancel to `{CLIENT_URL}/payment/cancel?bookingId={bookingId}`.
+  On success Stripe redirects to `{CLIENT_URL}/payment/success?bookingId={bookingId}&session_id={CHECKOUT_SESSION_ID}`, or on cancel to `{CLIENT_URL}/payment/cancel?bookingId={bookingId}`.
 - **Errors**: `400` (validation / booking already paid / no bookingId or vehicle details), `401`, `403` (not the booking owner), `404` (booking/vehicle not found), `409` (dates overlap), `500` (Stripe not configured)
 
-### POST /api/payments/webhook
+### POST /api/payments/verify-session
 
-Stripe webhook endpoint. Must be called by Stripe with the `stripe-signature` header; the raw JSON body is verified with `STRIPE_WEBHOOK_SECRET`. On `checkout.session.completed` it marks `booking.paymentStatus = "PAID"`, stores the Stripe `paymentIntentId` on the booking (and the payment row) for future refunds. The booking `status` stays `PENDING` awaiting vendor action.
+Directly verifies a Stripe Checkout Session and confirms payment — replaces the Stripe webhook. No webhook, no signature, and no `STRIPE_WEBHOOK_SECRET` required; works identically in local dev and in production.
 
-- **Auth**: None (verified via Stripe signature header)
-- **Headers**: `stripe-signature: <sig>`
-- **Request body**: raw JSON (Stripe event) — do **not** send JSON-parsed body.
+- **Auth**: Required — role `CUSTOMER` or `ADMIN` (must own the booking unless admin)
+- **Request body**:
+  ```json
+  { "session_id": "cs_test_..." }
+  ```
+- **Behavior**:
+  - Retrieves the session from Stripe (`checkout.sessions.retrieve`, with `payment_intent` expanded).
+  - Resolves the booking via `session.metadata.bookingId` (falling back to the stored `stripeSessionId`).
+  - If `session.payment_status === "paid"` and the booking is not already settled: sets `booking.paymentStatus = "PAID"` and stores the Stripe `payment_intent` id (on the booking and payment row) for future refunds. The booking `status` stays `PENDING` awaiting vendor action.
+  - **Idempotent**: verifying an already-`PAID` booking is a no-op returning the current state; an already-`REFUNDED` booking is never regressed.
+  - If Stripe has not finished processing (`payment_status !== "paid"`), the current state is returned and the frontend may retry with backoff.
 - **Success (200 OK)**:
   ```json
-  { "received": true }
+  {
+    "success": true,
+    "message": "Payment verified successfully",
+    "data": {
+      "paid": true,
+      "booking": { "id": "uuid", "status": "PENDING", "paymentStatus": "PAID", "vehicle": { "name": "Toyota Land Cruiser" } }
+    }
+  }
   ```
-- **Errors**: `400` (missing/invalid signature), `500` (webhook secret or Stripe not configured)
+- **Errors**: `400` (missing session_id), `401`, `403` (not the booking owner), `404` (no booking for this session), `500` (Stripe not configured / session retrieval failed)
 
 ### GET /api/payments/:bookingId
 

@@ -11,6 +11,12 @@ router.post(
   authorizeRoles('CUSTOMER'),
   PaymentController.createCheckoutSession
 );
+router.post(
+  '/verify-session',
+  authMiddleware,
+  authorizeRoles('CUSTOMER', 'ADMIN'),
+  PaymentController.verifySession
+);
 router.get('/:bookingId', authMiddleware, PaymentController.getPaymentByBooking);
 
 export default router;
