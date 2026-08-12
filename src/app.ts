@@ -11,7 +11,15 @@ import sendResponse from './utils/sendResponse';
 
 const app: Application = express();
 
-app.use(helmet());
+// COOP must be `same-origin-allow-popups` (not helmet's default `same-origin`) so the
+// Google account-chooser popup opened from the frontend can postMessage its credential
+// back to the parent window. Only the COOP directive is customized; all other helmet
+// security defaults (CSP, X-Frame-Options, HSTS, etc.) are left untouched.
+app.use(
+  helmet({
+    crossOriginOpenerPolicy: { policy: 'same-origin-allow-popups' },
+  })
+);
 app.use(
   cors({
     origin: env.CLIENT_URL,
