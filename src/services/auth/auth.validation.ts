@@ -24,9 +24,16 @@ const changePasswordSchema = z
   })
   .strict();
 
+const setPasswordSchema = z
+  .object({
+    newPassword: z.string().min(6, 'New password must be at least 6 characters'),
+  })
+  .strict();
+
 export const AuthValidation = {
   registerSchema,
   loginSchema,
   googleLoginSchema,
   changePasswordSchema,
+  setPasswordSchema,
 };

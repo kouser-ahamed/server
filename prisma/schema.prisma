@@ -45,6 +45,7 @@ model User {
   password     String?
   phone        String?
   profileImage String?
+  googleId     String?  @unique
   role         UserRole @default(CUSTOMER)
   authProvider String   @default("credentials")
   isDeleted    Boolean  @default(false)

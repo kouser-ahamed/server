@@ -77,11 +77,15 @@ const updateProfile = async (userId: string, authUser: AuthUser, payload: unknow
     throw new AppError(404, 'User not found.');
   }
 
-  return prisma.user.update({
+  const updated = await prisma.user.update({
     where: { id: userId },
     data,
-    select: userSelect,
+    select: { ...userSelect, password: true },
   });
+
+  const { password, ...safeUser } = updated;
+
+  return { ...safeUser, hasPassword: Boolean(password) };
 };
 
 const toggleBlock = async (userId: string, authUser: AuthUser) => {

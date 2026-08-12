@@ -80,6 +80,17 @@ const changePassword = catchAsync(async (req: Request, res: Response) => {
   });
 });
 
+const setPassword = catchAsync(async (req: Request, res: Response) => {
+  await AuthService.setPassword(req.user!, req.body);
+
+  sendResponse(res, {
+    success: true,
+    statusCode: 200,
+    message: 'Password set successfully',
+    data: null,
+  });
+});
+
 export const AuthController = {
   register,
   login,
@@ -87,4 +98,5 @@ export const AuthController = {
   getMe,
   logout,
   changePassword,
+  setPassword,
 };

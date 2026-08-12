@@ -21,6 +21,7 @@ const sanitizeUser = (user: {
   email: string;
   phone: string | null;
   profileImage: string | null;
+  password: string | null;
   role: string;
   authProvider: string;
   createdAt: Date;
@@ -32,6 +33,7 @@ const sanitizeUser = (user: {
   profileImage: user.profileImage,
   role: user.role,
   authProvider: user.authProvider,
+  hasPassword: Boolean(user.password),
   createdAt: user.createdAt,
 });
 
@@ -60,6 +62,7 @@ const register = async (payload: unknown) => {
       email: true,
       phone: true,
       profileImage: true,
+      password: true,
       role: true,
       authProvider: true,
       createdAt: true,
@@ -85,12 +88,11 @@ const login = async (payload: unknown) => {
     throw new AppError(401, 'Invalid email or password.');
   }
 
-  if (user.authProvider === 'google') {
-    throw new AppError(401, 'This email is registered via Google, please use Google login.');
-  }
-
   if (!user.password) {
-    throw new AppError(401, 'Invalid email or password.');
+    throw new AppError(
+      401,
+      "This account doesn't have a password set. Please log in with Google, or set a password from your profile after logging in with Google."
+    );
   }
 
   const isPasswordValid = await bcrypt.compare(data.password, user.password);
@@ -127,7 +129,12 @@ const googleLogin = async (payload: unknown) => {
     throw new AppError(401, 'Invalid Google token.');
   }
 
-  const { email, name, picture } = payloadFromGoogle;
+  const emailVerified = payloadFromGoogle.email_verified;
+  if (emailVerified !== true) {
+    throw new AppError(400, 'Google email is not verified.');
+  }
+
+  const { email, name, picture, sub: googleId } = payloadFromGoogle;
 
   let user = await prisma.user.findUnique({ where: { email } });
 
@@ -146,14 +153,16 @@ const googleLogin = async (payload: unknown) => {
         email,
         password: null,
         authProvider: 'google',
+        googleId,
         profileImage: picture ?? null,
         role: 'CUSTOMER',
       },
     });
-  } else if (user.authProvider === 'credentials') {
+  } else if (!user.googleId) {
     user = await prisma.user.update({
       where: { id: user.id },
       data: {
+        googleId,
         authProvider: 'google',
         profileImage: user.profileImage ?? picture ?? null,
       },
@@ -174,6 +183,7 @@ const getMe = async (authUser: AuthUser) => {
       email: true,
       phone: true,
       profileImage: true,
+      password: true,
       role: true,
       authProvider: true,
       isBlocked: true,
@@ -186,7 +196,9 @@ const getMe = async (authUser: AuthUser) => {
     throw new AppError(404, 'User not found.');
   }
 
-  return user;
+  const { password, ...safeUser } = user;
+
+  return { ...safeUser, hasPassword: Boolean(password) };
 };
 
 const changePassword = async (authUser: AuthUser, payload: unknown) => {
@@ -194,14 +206,14 @@ const changePassword = async (authUser: AuthUser, payload: unknown) => {
 
   const user = await prisma.user.findUnique({
     where: { id: authUser.id },
-    select: { id: true, password: true, isDeleted: true, authProvider: true },
+    select: { id: true, password: true, isDeleted: true },
   });
 
   if (!user || user.isDeleted) {
     throw new AppError(404, 'User not found.');
   }
 
-  if (user.authProvider === 'google' || !user.password) {
+  if (!user.password) {
     throw new AppError(400, 'Your account does not have a password set.');
   }
 
@@ -220,10 +232,37 @@ const changePassword = async (authUser: AuthUser, payload: unknown) => {
   return null;
 };
 
+const setPassword = async (authUser: AuthUser, payload: unknown) => {
+  const data = AuthValidation.setPasswordSchema.parse(payload);
+
+  const user = await prisma.user.findUnique({
+    where: { id: authUser.id },
+    select: { id: true, password: true, isDeleted: true },
+  });
+
+  if (!user || user.isDeleted) {
+    throw new AppError(404, 'User not found.');
+  }
+
+  if (user.password) {
+    throw new AppError(400, 'You already have a password set. Use "Change Password" to update it.');
+  }
+
+  const hashedPassword = await bcrypt.hash(data.newPassword, env.BCRYPT_SALT_ROUNDS);
+
+  await prisma.user.update({
+    where: { id: authUser.id },
+    data: { password: hashedPassword },
+  });
+
+  return null;
+};
+
 export const AuthService = {
   register,
   login,
   googleLogin,
   getMe,
   changePassword,
+  setPassword,
 };
